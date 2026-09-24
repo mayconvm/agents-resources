@@ -1,0 +1,6 @@
+interface:
+  display_name: "K8s Helm Ingress Routing"
+  short_description: "IngressRoute first for Traefik"
+  default_prompt: "Use $k8s-helm-ingress-routing to configure or fix Kubernetes ingress routing in a Helm chart, preferring Traefik IngressRoute + Middleware before falling back to plain Ingress."
+policy:
+  allow_implicit_invocation: true

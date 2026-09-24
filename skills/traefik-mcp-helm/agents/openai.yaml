@@ -1,0 +1,6 @@
+interface:
+  display_name: "Traefik MCP Helm"
+  short_description: "Traefik MCP routing first"
+  default_prompt: "Use $traefik-mcp-helm to configure a Helm chart for a Go MCP service behind Traefik, preferring IngressRoute + Middleware for /mcp/<sub-path> routing before falling back to plain Ingress."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/config.schema.json
+sources:
+  skills: /home/mayconvm/.agents/skills
+  agents: /home/mayconvm/.agents/agents
+git_root: root
+mode: copy
+targets:
+  cursor:
+    skills:
+      path: /home/mayconvm/.cursor/skills
+  opencode:
+    skills:
+      path: /home/mayconvm/.config/opencode/skills
+  universal:
+    skills:
+      path: /home/mayconvm/.agents/skills
+ignore:
+  - .DS_Store
+  - .git/
+  - __pycache__/
+audit:
+  block_threshold: CRITICAL
+extras:
+  - name: rules
+    targets:
+      - path: ~/.claude/rules
+      - path: ~/.cursor/rules
+        mode: copy

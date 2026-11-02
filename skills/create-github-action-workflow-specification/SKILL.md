@@ -118,6 +118,7 @@ build_artifact: file  # Description: [content type]
 ### Environmental Constraints
 
 - **Runner Requirements**: [OS/hardware needs]
+- **Target Platforms**: [e.g. linux/amd64, linux/arm64 — mandatory for container builds, see Container Image Rules]
 - **Network Access**: [External connectivity needs]
 - **Permissions**: [Required access levels]
 
@@ -235,7 +236,23 @@ When analyzing the workflow file:
 4. **Capture Constraints**: Extract timeouts, permissions, and limits
 5. **Define Quality Gates**: Identify validation and approval points
 6. **Document Error Paths**: Map failure scenarios and recovery
-7. **Abstract Implementation**: Focus on behavior, not syntax
+7. **Enforce Container Rules**: If the workflow builds container images, apply `Container Image Rules` below
+8. **Abstract Implementation**: Focus on behavior, not syntax
+
+## Container Image Rules
+
+Mandatory for any workflow that builds and pushes container images:
+
+- **Multi-arch always**: every image MUST be built for `linux/amd64` AND
+  `linux/arm64` (single-arch images fail on clusters with a different node
+  architecture, e.g. `no match for platform in manifest`).
+- **Record platforms**: list target platforms in `Execution Constraints /
+  Environmental Constraints` (`Target Platforms`) of the spec.
+- **Acceptance criteria**: each image requirement row MUST state the expected
+  manifest list (e.g. `docker buildx imagetools inspect` shows both arches).
+- **Single-arch exception**: only when the target environment is proven
+  single-arch; document the constraint and the owner who approved it in the
+  spec's `Version History`.
 
 ## Mermaid Diagram Guidelines
 

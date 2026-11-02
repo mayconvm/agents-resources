@@ -1,6 +1,6 @@
 ---
 name: helm-chart-scaffolding
-description: Design, organize, and manage Helm charts for templating and packaging Kubernetes applications with reusable configurations. Use when creating Helm charts, packaging Kubernetes applications, or implementing templated deployments.
+description: Design, organize, and manage Helm charts for templating and packaging Kubernetes applications with reusable configurations. Use when creating Helm charts, packaging Kubernetes applications, implementing templated deployments, adapting an existing chart to a real cluster (Traefik vs nginx, ARM64, no cert-manager), or auditing a chart for production readiness before go-live.
 ---
 
 # Helm Chart Scaffolding
@@ -21,6 +21,136 @@ Use this skill when you need to:
 - Implement templating for reusable Kubernetes manifests
 - Set up Helm chart repositories
 - Follow Helm best practices and conventions
+- **Adapt an existing chart to a real cluster** (see Cluster Profile below)
+- **Audit a chart for production readiness** before go-live (see Production Gate)
+
+## Cluster Profile — read this BEFORE writing templates
+
+A chart that lints is not a chart that deploys. **`helm lint` only parses templates; it
+never validates against the cluster.** Always inspect the target cluster first, then write
+templates that match it.
+
+### Reference cluster (crm-whats production target)
+
+Verified on 02/11/2026 with read-only commands. Re-verify on a different target.
+
+| Item | Value | Consequence for the chart |
+|---|---|---|
+| Distribution | k3s **v1.35.5** | CRDs and RBAC are plain upstream Kubernetes |
+| Nodes | **1 node**, 4 vCPU, 23 Gi RAM | No HA; no `PodAntiAffinity` that needs 2 nodes; **1 replica is the only safe default** |
+| **Architecture** | **aarch64 / linux-arm64** (Oracle Linux 9.8, kernel `el9uek.aarch64`) | Every app image **must** publish `linux/arm64`. An amd64-only image = `exec format error` |
+| IngressClass | **`traefik`** only (Traefik v3.6.12) | **No ingress-nginx.** `nginx.ingress.kubernetes.io/*` annotations are silently ignored |
+| Traefik entrypoints | `web` 80, `websecure` 443 | Route on **`web`**: TLS terminates at the edge proxy (see TLS topology below) |
+| **TLS** | **Terminated by an external reverse proxy**, not the cluster | The chart must stay **HTTP-only**: no `tls:`, no cert-manager, no ACME, no `websecure` |
+| Network path | Edge proxy → **VPN** `100.101.79.205` → Traefik `10.0.0.217` | The proxy must forward `Host` and `X-Forwarded-Proto/Host/For`; the app needs `trustProxy` |
+| storageClass | `local-path` (rancher.io/local-path), **default** | **No quota enforcement.** `spec.resources.requests.storage` is decorative |
+| Disk | 29.4 Gi total, **15.5 Gi available** | PVC sizes in `values.yaml` are a promise you cannot keep — size against real free space |
+| Registry access | GHCR private, credentials in `imagePullSecrets` | No local `docker build` reaches the cluster — **everything flows through the registry** |
+| Secrets | `sealed-secrets` controller installed | Preferred over raw `kubectl create secret` |
+| Add-ons absent | cert-manager, metrics-server HPA targets, external-dns | Do not assume they exist |
+
+### Mandatory pre-flight inspection
+
+Run these before writing or changing templates. Everything is read-only.
+
+```bash
+# What controller actually exists?
+kubectl get ingressclass
+kubectl get pods -A | grep -iE 'traefik|nginx|cert-manager|external-dns'
+
+# Which CRDs can I rely on?
+kubectl get crd | grep -E 'traefik\.io|cert-manager\.io'
+
+# Storage reality (local-path does NOT enforce the PVC size)
+kubectl get storageclass
+kubectl get pvc -A
+kubectl top nodes 2>/dev/null || true
+kubectl get node -o jsonpath='{.items[0].status.allocatable}{"\n"}'
+
+# Real free disk on the node (no pod required)
+NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+kubectl get --raw "/api/v1/nodes/$NODE/proxy/stats/summary" \
+  | jq '{capacity: .node.fs.capacityBytes, used: .node.fs.usedBytes, avail: .node.fs.availableBytes}'
+
+# Architecture of the target (decides image platforms)
+kubectl get nodes -o wide   # check OS-IMAGE / kernel for aarch64
+
+# Is the Traefik websecure entrypoint actually serving TLS?
+kubectl get deploy -n kube-system traefik \
+  -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | grep -iE 'acme|tls|cert'
+```
+
+### Sizing against a single node
+
+```bash
+# Sum of requests the chart will ask for, vs. what is free
+kubectl describe node | grep -A8 'Allocated resources'
+```
+
+Rules:
+
+1. **Requests must fit in `allocatable - already requested`.** Do not size for "a real
+   cluster"; size for this one. Overcommitted requests = pods stuck `Pending`, and with a
+   single node there is nowhere to schedule them.
+2. **`local-path` ignores the PVC size.** If the sum of PVCs exceeds free disk, the chart
+   will fill the node and take down Postgres with it. Prefer externalizing object storage.
+3. **Single node means `replicaCount: 1`** for stateful components, and a `RollingUpdate`
+   with `maxUnavailable: 0` will deadlock on a `ReadWriteOnce` volume: the new pod cannot
+   mount the PVC until the old one releases it.
+
+## Production Gate — the checks that `helm lint` cannot do
+
+`helm lint` passing means "the templates parse". It says nothing about whether the release
+will run. Before declaring a chart production-ready, every item below must be answered.
+
+| # | Gate | How to check | Why it bites |
+|---|---|---|---|
+| 1 | **Image tags exist** in the registry | `docker manifest inspect <repo>:<tag>` for every referenced image | `ImagePullBackOff` with a chart that lints perfectly |
+| 2 | **Image platforms cover the node arch** | `docker manifest inspect <repo>:<tag>` → look for `arm64` | `exec format error` on an aarch64 node |
+| 3 | **Ingress controller matches annotations** | `kubectl get ingressclass` | nginx `rewrite-target` on Traefik → 404 on every path |
+| 4 | **TLS terminates somewhere real, and only once** | Edge proxy owns the cert (chart HTTP-only), **or** cert-manager/Secret in-cluster | Enabling `tls:` when the edge already terminates TLS serves a self-signed cert on an entrypoint the proxy cannot reach; enabling nothing when the cluster is the edge breaks `Secure` cookies |
+| 5 | **Every `secretKeyRef` is satisfiable** | `existingSecret` has **all** keys, or `optional: true` | One missing key = `CreateContainerConfigError`, pod never starts |
+| 6 | **Public endpoints are browser-reachable** | presign/CDN host is a public DNS name, not a Service DNS name | Signed URLs point at `http://svc:9000`, unreachable from a browser |
+| 7 | **Wildcard DNS exists when tenancy uses subdomains** | `dig +short A '<slug>.<base>'` | No wildcard = no tenant can log in |
+| 8 | **Requests and PVCs fit the node** | `kubectl describe node` + `stats/summary` | `Pending` pods, or a full disk |
+| 9 | **Build-time config is baked correctly** | env vars consumed by `vite`/`next` at build are set **before** the image is built | Wrong domain baked in; **only fixable by rebuilding** |
+| 10 | **Credentials/digests are reproducible** | registry tag from a release pipeline, not `latest` | Rollback is impossible and `helm rollback` restores nothing |
+| 11 | **StatefulSets are not fighting a RWO volume** | `strategy`/`updateStrategy` vs `ReadWriteOnce` | Rollout deadlock on a single node |
+| 12 | **Migrations run once, not per replica** | initContainer on a multi-replica Deployment without a lock | Concurrent schema changes corrupt the migration journal |
+| 13 | **Operational jobs exist** | admin bootstrap, bucket init, DB backup | Chart installs but the product is unusable/unrecoverable |
+
+Prefer a **chart-owned `values.schema.json`** plus a CI job running `helm lint`,
+`helm template` and `kubectl apply --dry-run=server` so these regressions are caught
+before the cluster.
+
+### `values.schema.json` — fail fast on typos
+
+A misspelled key in `values.yaml` is silently ignored by Helm. A schema turns it into a
+hard error:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["image", "ingress"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["tag"],
+      "properties": { "tag": { "type": "string", "minLength": 1 } }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "controller": { "type": "string", "enum": ["traefik", "nginx"] },
+        "hosts": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      }
+    }
+  }
+}
+```
+
+Validate with `helm lint --strict` and `helm template ... > /dev/null` in CI.
 
 ## Helm Overview
 
@@ -424,29 +554,70 @@ postgresql:
 helm install my-app ./my-app -f values-prod.yaml --namespace production
 ```
 
-### 10. Implement Hooks and Tests
+### 10. Implement Hooks and Tests — and know when NOT to use a hook
 
-**Pre-install hook:**
+> **`pre-install` runs BEFORE the release resources exist.** A `pre-install` Job that
+> connects to a database shipped by the same chart **can never work on the first install**:
+> the Postgres StatefulSet, its Service and its PVC do not exist yet. This is exactly the
+> bug that had to be fixed in `crm-whats`: the migrations Job was moved from a
+> `pre-install` hook to a **plain (non-hook) `Job`** / **initContainer**, which Helm only
+> creates as part of the release and which can retry until the dependency is up.
+
+**Use a hook only when ordering relative to the release lifecycle genuinely matters:**
+
+| Goal | Correct primitive |
+|---|---|
+| Run schema migrations before the app starts | **initContainer** on the app, or a plain `Job` with a retry loop |
+| Create a bucket/admin/tenant once the DB is up | **plain `Job`**, or `post-install` hook **with** a wait loop |
+| Prune something before deleting the release | `pre-delete` hook |
+| Smoke-test the installed release | `test` hook |
+
+**Never** put a "wait for dependency" step in a `pre-install` hook for a dependency the
+chart itself creates.
+
+**Plain Job that waits for its dependency (correct pattern):**
 
 ```yaml
-# templates/pre-install-job.yaml
+# templates/migrate-job.yaml — NO hook: created with the release, retries until DB is up
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "my-app.fullname" . }}-db-setup
+  name: {{ include "my-app.fullname" . }}-migrate
   annotations:
-    "helm.sh/hook": pre-install
-    "helm.sh/hook-weight": "-5"
-    "helm.sh/hook-delete-policy": hook-succeeded
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
+  backoffLimit: 6
   template:
     spec:
-      containers:
-      - name: db-setup
-        image: postgres:15
-        command: ["psql", "-c", "CREATE DATABASE myapp"]
       restartPolicy: Never
+      initContainers:
+        - name: wait-for-db
+          image: postgres:16
+          command: ['/bin/sh', '-c']
+          args:
+            - |
+              set -eu
+              until pg_isready -h {{ include "my-app.fullname" . }}-postgres -p 5432; do
+                echo "aguardando postgres..."; sleep 5
+              done
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.migrations.repository }}:{{ .Values.image.tag }}"
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secrets.existingSecret }}
 ```
+
+Caveats that follow from this pattern:
+
+- A plain `Job` is **not** re-run by `helm upgrade`. Give the name a checksum annotation
+  (`checksum/config: {{ include ... | sha256sum }}`) or bump a `migrations.revision` value,
+  otherwise later schema changes never apply.
+- A Job in an initContainer-style role on a **multi-replica Deployment** runs once per
+  replica. Use a single-replica Deployment, a Job, or make the migration idempotent **and**
+  serialized (advisory lock). Drizzle 0.45's migrator uses a transaction but **no advisory
+  lock**.
+- `helm.sh/hook-delete-policy: before-hook-creation` avoids `Job already exists` on retries.
 
 **Test connection:**
 
@@ -472,6 +643,218 @@ spec:
 ```bash
 helm test my-app
 ```
+
+## Ingress: match the controller that exists
+
+Charts are usually scaffolded against **ingress-nginx** and then deployed to a cluster that
+runs **Traefik** (k3s default). The result lints and silently 404s.
+
+### TLS topology first: edge vs in-cluster
+
+Decide **where TLS terminates** before writing the Ingress. Getting this backwards is a
+common and confusing failure.
+
+| Topology | Who owns the cert | Chart must | Chart must NOT |
+|---|---|---|---|
+| **Edge proxy / LB / CDN** (external, reaches the cluster over HTTP) | The proxy — Let's Encrypt, ACME, corporate CA | Route on the **HTTP** entrypoint; trust `X-Forwarded-*` | Configure `tls:`, cert-manager, ACME, or `websecure` |
+| **In-cluster** (cert-manager, or a manually managed Secret) | The cluster | `tls.secretName` on the Ingress/IngressRoute + `websecure` | Assume a cert exists without a `Certificate`/Secret |
+| **Both (edge terminates, cluster re-encrypts)** | Two certs | `websecure` + an internal cert; the backend speaks HTTPS | Leave the hop plaintext if the network is untrusted |
+
+**Rule:** if a proxy outside the cluster terminates TLS, the chart is HTTP-only. Adding
+`tls:` there makes Traefik serve its self-signed default cert on `websecure`, which the
+proxy cannot even reach — the symptom is a certificate error at the edge or a dead route,
+not an obvious "TLS misconfigured".
+
+When TLS is external, the app behind it still needs:
+
+- `trustProxy` enabled, so `request.ip` and rate limiting see the real client instead of all
+  traffic collapsing into the proxy's IP.
+- `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-For` forwarded by the proxy.
+  Without `X-Forwarded-Proto: https`, `Secure` cookies are dropped and absolute URLs come out
+  as `http://`.
+- The original `Host` header preserved — mandatory when tenants are resolved by subdomain or
+  the app validates the host.
+- HSTS emitted by the app (it is correct even when TLS is at the edge: the browser sees
+  HTTPS).
+
+```yaml
+# values.yaml — edge TLS topology
+ingress:
+  enabled: true
+  controller: traefik
+  entryPoint: web            # HTTP only; the edge proxy terminates TLS
+  hosts: ["app.example.com", "*.app.example.com"]
+  tls: null                  # never enable TLS in the cluster in this topology
+```
+
+### nginx vs Traefik — the incompatibilities
+
+| Capability | ingress-nginx | Traefik v3 (Ingress provider) |
+|---|---|---|
+| Class | `ingressClassName: nginx` | `ingressClassName: traefik` |
+| Strip a prefix | `nginx.ingress.kubernetes.io/rewrite-target: /$2` | **Not supported**; use `Middleware stripPrefix` + `IngressRoute` |
+| Regex paths | Supported with `use-regex: "true"` | **Not supported** on Ingress; `IngressRoute` `match` is fine |
+| Body size | `nginx.ingress.kubernetes.io/proxy-body-size` | Ignored; use a `Middleware`/`buffering` or `serversTransport` |
+| Timeouts | `proxy-read-timeout` / `proxy-send-timeout` | `IngressRoute` `serversTransport` or entrypoint config |
+| Unknown annotations | Applied | **Silently ignored** (no warning) |
+
+**Design rule:** make the controller a first-class value and render **one or the other**, so
+the chart is honest about what it supports.
+
+```yaml
+# values.yaml
+ingress:
+  enabled: true
+  controller: traefik        # traefik | nginx
+  className: traefik
+  hosts: ["app.example.com", "*.app.example.com"]   # wildcard when tenancy is per-subdomain
+  tls:
+    secretName: ""           # must point at a REAL certificate
+```
+
+```yaml
+# templates/ingress-nginx.yaml
+{{- if and .Values.ingress.enabled (eq .Values.ingress.controller "nginx") }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "my-app.fullname" . }}-api
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  # ...regex path /api(/|$)(.*)
+{{- end }}
+```
+
+```yaml
+# templates/traefik-middleware.yaml
+{{- if and .Values.ingress.enabled (eq .Values.ingress.controller "traefik") }}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "my-app.fullname" . }}-strip-api
+spec:
+  stripPrefix:
+    prefixes: ["/api"]
+{{- end }}
+```
+
+```yaml
+# templates/traefik-ingressroute.yaml
+{{- if and .Values.ingress.enabled (eq .Values.ingress.controller "traefik") }}
+{{- /* Traefik match rules use backticks for the Host list; build them from values. */}}
+{{- $hosts := list }}
+{{- range .Values.ingress.hosts }}
+{{- $hosts = append $hosts (printf "Host(`%s`)" .) }}
+{{- end }}
+{{- $rule := join " || " $hosts }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ include "my-app.fullname" . }}-api
+spec:
+  entryPoints: ["websecure"]
+  routes:
+    - match: {{ printf "%s && PathPrefix(`/api`)" $rule | quote }}
+      kind: Rule
+      middlewares:
+        - name: {{ include "my-app.fullname" . }}-strip-api
+      services:
+        - name: {{ include "my-app.fullname" . }}-api
+          port: {{ .Values.service.api.port }}
+    - match: {{ printf "%s && PathPrefix(`/ws`)" $rule | quote }}
+      kind: Rule
+      services:
+        - name: {{ include "my-app.fullname" . }}-api
+          port: {{ .Values.service.api.port }}
+  {{- if .Values.ingress.tls.secretName }}
+  tls:
+    secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ include "my-app.fullname" . }}-web
+spec:
+  entryPoints: ["websecure"]
+  routes:
+    - match: {{ $rule | quote }}
+      kind: Rule
+      services:
+        - name: {{ include "my-app.fullname" . }}-web
+          port: {{ .Values.service.web.port }}
+  {{- if .Values.ingress.tls.secretName }}
+  tls:
+    secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+{{- end }}
+```
+
+Notes that prevent real outages:
+
+1. **Route specificity.** Traefik matches by rule priority, so `/api` and `/ws` routes must
+   be on a **different `IngressRoute` resource** than the catch-all `/`. Otherwise the
+   catch-all wins and API calls land on the frontend.
+2. **Wildcard hosts** require `Host(\`*.example.com\`)` **in addition to** the apex host —
+   list both in `ingress.hosts`.
+3. **Do not expose `/metrics`, `/healthz`, `/readyz` on the public Ingress.** They are for
+   the cluster; publishing them leaks internals and route counters.
+4. **TLS without a cert source is worse than no TLS**: Traefik serves its self-signed
+   default cert, which browsers reject. Empty `tls.secretName` must mean "HTTP only",
+   explicitly.
+
+## Secrets: every `secretKeyRef` is a startup dependency
+
+A `secretKeyRef` without `optional: true` makes the **pod unschedulable-adjacent**:
+`CreateContainerConfigError` until the key exists. A single missing optional key (an AI API
+key for a deployment that has AI disabled, an SMTP password) takes the whole app down.
+
+```yaml
+# Required: fail loudly, this is genuinely mandatory
+- name: DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.secrets.existingSecret }}
+      key: DATABASE_URL
+
+# Optional feature: must not block startup
+- name: AI_API_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.secrets.existingSecret }}
+      key: AI_API_KEY
+      optional: true
+```
+
+Additional rules:
+
+- **Generate the Secret out-of-band** (Sealed Secrets, External Secrets, SOPS) and point
+  `secrets.existingSecret` at it. Loading real values through `values.yaml` puts secrets in
+  git and in `helm get values`.
+- **Secret key names must match the `<secretKeyRef>`s exactly.** Document the required key
+  list in `README.md`; drift here is the most common first-install failure.
+- **Service DNS names depend on the release name.** `include "chart.fullname"` changes with
+  `--generate-name` / a different release name, so DSNs hardcoded in a Secret silently point
+  at a non-existent host. Either document "the Secret must be built for release X" or
+  resolve hosts from the ConfigMap and keep only credentials in the Secret.
+- **Never put credentials in ConfigMap.** ConfigMap is for non-secret env only.
+
+## Stateful workloads on a single node
+
+- `ReadWriteOnce` + `maxUnavailable: 0` (or a `RollingUpdate` StatefulSet) **deadlocks** on
+  a single node: the replacement pod cannot attach the volume while the old pod holds it.
+  For StatefulSets use the default `OnDelete`/`RollingUpdate` ordering and accept a brief
+  outage, or use `Recreate` on Deployments with PVCs.
+- **`local-path` does not enforce `requests.storage`.** Treat the PVC size as documentation.
+  Sum all PVCs against real free disk before installing; prefer managed object storage for
+  anything unbounded.
+- **Postgres/Redis init SQL runs once, on an empty volume only.** Changing `initSql` later
+  has no effect. Roles created there with hardcoded passwords must stay in sync with the
+  Secret, or the app cannot log in.
+
 
 ## Common Patterns
 
@@ -518,6 +901,62 @@ global:
 image: {{ .Values.global.imageRegistry }}/{{ .Values.image.repository }}
 ```
 
+## Images: architecture, tags and build-time config
+
+### Match the node architecture
+
+The reference cluster is **aarch64**. A multi-arch build is not a nice-to-have:
+
+```bash
+# Confirm what your build produced
+docker manifest inspect ghcr.io/org/app:1.2.3 \
+  | jq -r '.manifests[].platform | "\(.os)/\(.architecture)"'
+# must include linux/arm64
+```
+
+```yaml
+# CI build (GitHub Actions / buildx)
+- uses: docker/build-push-action@v6
+  with:
+    platforms: linux/amd64,linux/arm64
+```
+
+A single-arch amd64 image on an arm64 node fails at container start with
+`exec format error` — **not** at pull time, so it looks like a crash-loop.
+
+### Verify that every referenced tag exists
+
+```bash
+# One check per image referenced by values.yaml — do this before helm install
+for img in $(helm template r . -f values-prod.yaml \
+  | grep -oE 'image: [^ ]+' | awk '{print $2}' | sort -u); do
+  docker manifest inspect "$img" >/dev/null 2>&1 \
+    && echo "OK       $img" || echo "MISSING  $img"
+done
+```
+
+### Build-time (baked) configuration
+
+If the frontend reads a variable at **build** time (`VITE_*`, `NEXT_PUBLIC_*`,
+`REACT_APP_*`), it lives **inside the image layer**. Setting it in the ConfigMap at runtime
+changes nothing.
+
+Consequences:
+
+1. The CI variable/env must be set **before** the release is tagged.
+2. Changing the domain later requires **rebuilding and republishing the image**, not just
+   `helm upgrade`.
+3. Verify by rendering the image's built output, not by reading `values.yaml`.
+
+```yaml
+# Build args must be wired in the workflow, with a real default that is not "localhost"
+build-args: |
+  VITE_APP_BASE_DOMAIN=${{ vars.APP_BASE_DOMAIN }}
+```
+
+A `|| 'localhost'` fallback in CI is a silent trap: the pipeline stays green and the
+production bundle is unusable.
+
 ## Best Practices
 
 1. **Use semantic versioning** for chart and app versions
@@ -530,6 +969,34 @@ image: {{ .Values.global.imageRegistry }}/{{ .Values.image.repository }}
 8. **Include NOTES.txt** with usage instructions
 9. **Add labels** consistently using helpers
 10. **Test installations** in all environments
+11. **Inspect the target cluster before writing templates** — controller, arch, storage class, free resources
+12. **Treat `helm lint` as a syntax check only**; run the Production Gate before go-live
+13. **Never use a `pre-install` hook for something the chart itself creates**
+14. **Make the Ingress controller an explicit value** and support the one that actually exists
+15. **Mark optional secret keys `optional: true`**
+16. **Size requests and PVCs against `kubectl describe node`, not against a hypothetical cluster**
+
+## Anti-patterns seen in production charts
+
+Real defects found while auditing `crm-whats`; each one lints clean.
+
+| Anti-pattern | Symptom | Fix |
+|---|---|---|
+| `pre-install` Job that needs the chart's own Postgres | First install hangs forever | Plain `Job` / initContainer with wait-and-retry |
+| nginx annotations on a Traefik cluster | Every `/api` path 404s | `Middleware stripPrefix` + `IngressRoute`, or `ingress.controller` value |
+| `tls:` enabled when an external proxy already terminates TLS | Traefik serves its self-signed cert on `websecure`; the edge cannot reach it | Chart is HTTP-only; route on the `web` entrypoint |
+| Proxy not sending `X-Forwarded-Proto` | `Secure` cookies dropped, absolute URLs in `http://`, rate limit sees one IP | Forward `X-Forwarded-Proto/Host/For`; enable `trustProxy` |
+| Proxy rewriting `Host` | Subdomain tenancy fails, host guards reject | Preserve the original `Host` header |
+| `S3_PUBLIC_ENDPOINT: ""` with presigned URLs | Signed URL points at `http://svc:9000`; browser upload fails | Set a public host and sign with it (a second S3 client — SigV4 signs the `Host`) |
+| Helper computed but never used | Dead code; the value silently stays empty | Wire the helper into the template or delete it |
+| `secretKeyRef` without `optional: true` | `CreateContainerConfigError` when one optional key is absent | `optional: true` for feature flags |
+| Requests summing above node allocatable | Pods stuck `Pending`, nowhere to schedule on 1 node | Re-measure and shrink |
+| PVCs summing above free disk on `local-path` | Node disk fills, Postgres crashes | Size to reality or externalize storage |
+| `maxUnavailable: 0` + RWO PVC on 1 node | Rollout deadlock | `Recreate` or accept downtime |
+| Migrations as initContainer with >1 api replica | Concurrent migrations, no advisory lock | Single replica, or a Job with a lock |
+| `/metrics`, `/healthz` published on the public Ingress | Internal metrics/logs exposed | Keep them cluster-internal |
+| `VITE_*` set only in ConfigMap | Production bundle still points at `localhost` | Set at build time, rebuild to change |
+| No `values.schema.json` and no CI lint | Typos in values ship silently | Schema + `helm lint`/`template`/`dry-run` job |
 
 ## Troubleshooting
 
@@ -552,6 +1019,26 @@ helm dependency list
 helm install my-app ./my-app --dry-run --debug
 kubectl get events --sort-by='.lastTimestamp'
 ```
+
+**Release passes `helm lint` but pods do not start — diagnose in this order:**
+
+```bash
+kubectl -n <ns> get pods                                  # status tells you the layer
+kubectl -n <ns> describe pod <pod> | sed -n '/Events/,$p' # scheduling / image / config
+kubectl -n <ns> logs <pod> --previous                     # app-level crash
+kubectl -n <ns> get events --sort-by='.lastTimestamp'     # what changed
+```
+
+| Pod status | Likely cause |
+|---|---|
+| `Pending` | Requests above allocatable, or PVC unbound (`local-path` waits for a consumer, then fails on disk) |
+| `ImagePullBackOff` / `ErrImagePull` | Tag does not exist, or missing `imagePullSecrets` |
+| `exec format error` (CrashLoopBackOff) | Image has no `linux/arm64` |
+| `CreateContainerConfigError` | Missing Secret/ConfigMap key → `optional: true` or create the key |
+| `CrashLoopBackOff` | App-side config validation (`NODE_ENV=production` without a required secret), not the chart |
+| Ready but 404 on every path | Ingress controller/annotation mismatch |
+| Ready but login fails | TLS missing (`secure` cookie), or build-time domain wrong in the image |
+
 
 
 ## Related Skills

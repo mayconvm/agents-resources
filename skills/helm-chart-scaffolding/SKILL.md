@@ -1,6 +1,6 @@
 ---
 name: helm-chart-scaffolding
-description: Design, organize, and manage Helm charts for templating and packaging Kubernetes applications with reusable configurations. Use when creating Helm charts, packaging Kubernetes applications, implementing templated deployments, adapting an existing chart to a real cluster (Traefik vs nginx, ARM64, no cert-manager), or auditing a chart for production readiness before go-live.
+description: Design, organize, and manage Helm charts for templating and packaging Kubernetes applications with reusable configurations. Use when creating Helm charts, packaging Kubernetes applications, implementing templated deployments, adapting a chart to a real cluster (Traefik-only Ingress — never ingress-nginx, ARM64 images, edge TLS), or auditing a chart for production readiness before go-live.
 ---
 
 # Helm Chart Scaffolding
@@ -142,7 +142,7 @@ hard error:
     "ingress": {
       "type": "object",
       "properties": {
-        "controller": { "type": "string", "enum": ["traefik", "nginx"] },
+        "entryPoint": { "type": "string", "enum": ["web"] },
         "hosts": { "type": "array", "minItems": 1, "items": { "type": "string" } }
       }
     }
@@ -260,15 +260,14 @@ service:
   port: 80
   targetPort: 8080
 
-# Ingress configuration
+# Ingress configuration — Traefik only (never ingress-nginx)
 ingress:
   enabled: false
-  className: nginx
+  entryPoint: web          # HTTP; the edge proxy terminates TLS
   hosts:
-    - host: app.example.com
-      paths:
-        - path: /
-          pathType: Prefix
+    - app.example.com
+    - "*.app.example.com"  # wildcard when tenancy is per-subdomain
+  tls: null                # never enable TLS in the cluster with an edge proxy
 
 # Resources
 resources:
@@ -644,12 +643,19 @@ spec:
 helm test my-app
 ```
 
-## Ingress: match the controller that exists
+## Ingress: **always Traefik** — never ingress-nginx
 
-Charts are usually scaffolded against **ingress-nginx** and then deployed to a cluster that
-runs **Traefik** (k3s default). The result lints and silently 404s.
+**Hard rule for this environment: charts are Traefik-only.** The clusters run Traefik
+(k3s ships it by default), there is no ingress-nginx and adding one is out of scope.
+Do not scaffold `ingressClassName: nginx`, do not emit `nginx.ingress.kubernetes.io/*`
+annotations, and do not make the controller a `traefik | nginx` switch — a chart with an
+nginx path invites someone to use it and then silently 404s everything.
 
-### TLS topology first: edge vs in-cluster
+If you find an nginx-based chart, migrating it to Traefik is the default action. Keep the
+nginx comparison table below only as a **migration reference** (what each old annotation
+used to mean), never as an option to implement.
+
+### TLS topology: edge vs in-cluster
 
 Decide **where TLS terminates** before writing the Ingress. Getting this backwards is a
 common and confusing failure.
@@ -657,7 +663,7 @@ common and confusing failure.
 | Topology | Who owns the cert | Chart must | Chart must NOT |
 |---|---|---|---|
 | **Edge proxy / LB / CDN** (external, reaches the cluster over HTTP) | The proxy — Let's Encrypt, ACME, corporate CA | Route on the **HTTP** entrypoint; trust `X-Forwarded-*` | Configure `tls:`, cert-manager, ACME, or `websecure` |
-| **In-cluster** (cert-manager, or a manually managed Secret) | The cluster | `tls.secretName` on the Ingress/IngressRoute + `websecure` | Assume a cert exists without a `Certificate`/Secret |
+| **In-cluster** (cert-manager, or a manually managed Secret) | The cluster | `tls.secretName` on the `IngressRoute` + `websecure` | Assume a cert exists without a `Certificate`/Secret |
 | **Both (edge terminates, cluster re-encrypts)** | Two certs | `websecure` + an internal cert; the backend speaks HTTPS | Leave the hop plaintext if the network is untrusted |
 
 **Rule:** if a proxy outside the cluster terminates TLS, the chart is HTTP-only. Adding
@@ -678,59 +684,71 @@ When TLS is external, the app behind it still needs:
   HTTPS).
 
 ```yaml
-# values.yaml — edge TLS topology
+# values.yaml — Traefik + edge TLS
 ingress:
   enabled: true
-  controller: traefik
   entryPoint: web            # HTTP only; the edge proxy terminates TLS
   hosts: ["app.example.com", "*.app.example.com"]
   tls: null                  # never enable TLS in the cluster in this topology
 ```
 
-### nginx vs Traefik — the incompatibilities
-
-| Capability | ingress-nginx | Traefik v3 (Ingress provider) |
-|---|---|---|
-| Class | `ingressClassName: nginx` | `ingressClassName: traefik` |
-| Strip a prefix | `nginx.ingress.kubernetes.io/rewrite-target: /$2` | **Not supported**; use `Middleware stripPrefix` + `IngressRoute` |
-| Regex paths | Supported with `use-regex: "true"` | **Not supported** on Ingress; `IngressRoute` `match` is fine |
-| Body size | `nginx.ingress.kubernetes.io/proxy-body-size` | Ignored; use a `Middleware`/`buffering` or `serversTransport` |
-| Timeouts | `proxy-read-timeout` / `proxy-send-timeout` | `IngressRoute` `serversTransport` or entrypoint config |
-| Unknown annotations | Applied | **Silently ignored** (no warning) |
-
-**Design rule:** make the controller a first-class value and render **one or the other**, so
-the chart is honest about what it supports.
+Add a guard in the template so the decision cannot be reversed by accident:
 
 ```yaml
-# values.yaml
-ingress:
-  enabled: true
-  controller: traefik        # traefik | nginx
-  className: traefik
-  hosts: ["app.example.com", "*.app.example.com"]   # wildcard when tenancy is per-subdomain
-  tls:
-    secretName: ""           # must point at a REAL certificate
-```
-
-```yaml
-# templates/ingress-nginx.yaml
-{{- if and .Values.ingress.enabled (eq .Values.ingress.controller "nginx") }}
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {{ include "my-app.fullname" . }}-api
-  annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /$2
-    nginx.ingress.kubernetes.io/use-regex: "true"
-spec:
-  ingressClassName: {{ .Values.ingress.className }}
-  # ...regex path /api(/|$)(.*)
+{{- if or .Values.ingress.tls .Values.ingress.className }}
+{{- fail "ingress não suporta className/tls: o chart é Traefik-only e o TLS termina no proxy externo." }}
+{{- end }}
+{{- if ne (default "web" .Values.ingress.entryPoint) "web" }}
+{{- fail "entrypoint deve ser `web`: o proxy externo fala HTTP com o cluster." }}
 {{- end }}
 ```
 
+### Traefik: the routing primitives
+
+| Need | Traefik answer |
+|---|---|
+| Strip a path prefix (`/api/*` → `/v1/*`) | `Middleware` `stripPrefix` |
+| Prefix match | `PathPrefix('/api')` (note: also matches `/apifoo`; use `PathRegexp('^/api(/|$)')` if the app has a root route) |
+| Host match | `Host(\`app.example.com\`)` — **exact string compare, no wildcard**. For subdomains use `HostRegexp(\`^[^.]+\\.example\\.com$\`)`, which is a real regex (`regexp.Compile`): escape dots and anchor the pattern |
+| WebSocket | Native on HTTP routers — nothing to configure |
+| Body size / timeouts | `Middleware`/`serversTransport`, not annotations |
+
+### Three traps that no gate catches
+
+1. **`Host()` is NOT a wildcard matcher.** `Host(\`*.example.com\`)` matches only a host
+   *literally* named `*.example.com` — Traefik compares strings (`matcher.go: host()`,
+   `reqHost == host`). For subdomain tenancy use `HostRegexp` and translate the wildcard:
+   `*.example.com` → `^[^.]+\.example\.com$`. Idiom:
+   ```
+   {{- if contains "*" $host }}
+   {{- $pattern := $host | replace "." "\\." | replace "*" "[^.]+" }}
+   HostRegexp(`^%s$`)
+   {{- else }}
+   Host(`$host`)
+   {{- end }}
+   ```
+   `HostRegexp` compiles the argument with `regexp.Compile`, so dots MUST be escaped and
+   the pattern anchored (`^...$`), otherwise `example.com` also matches
+   `example.com.evil.test`. The apex is not covered by the wildcard — list both hosts.
+2. **`&&` binds tighter than `||`.** `Host(a) || Host(b) && PathPrefix(/x)` matches
+   `Host(a)` on **every** path — the apex swallows the whole app and the API is never
+   reached. **Always parenthesize the host group:**
+   `(Host(a) || Host(b)) && PathPrefix(...)`.
+   `helm lint`, `helm template` and `kubectl apply --dry-run=server` all pass with the
+   semantically wrong rule: they validate syntax, not meaning.
+3. **Route priority is not declaration order.** Each `route` becomes its own router; the
+   winner is the highest `priority`, whose default is the **length of the rule text**
+   (`GetRulePriority` in `pkg/muxer/http/mux.go`, sorted descending with a **non-stable**
+   sort, so ties are undefined). Put the catch-all and the specific routes in **separate
+   `IngressRoute` resources**; when a specific host must beat a broader catch-all (e.g. a
+   storage host that a tenant wildcard also matches), set an **explicit `priority`** and
+   document that it only has to exceed the catch-all's rule length.
+
+### Reference templates
+
 ```yaml
 # templates/traefik-middleware.yaml
-{{- if and .Values.ingress.enabled (eq .Values.ingress.controller "traefik") }}
+{{- if .Values.ingress.enabled }}
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
@@ -742,69 +760,65 @@ spec:
 ```
 
 ```yaml
-# templates/traefik-ingressroute.yaml
-{{- if and .Values.ingress.enabled (eq .Values.ingress.controller "traefik") }}
-{{- /* Traefik match rules use backticks for the Host list; build them from values. */}}
+# templates/ingress.yaml — IngressRoutes (Traefik only)
+{{- if .Values.ingress.enabled }}
 {{- $hosts := list }}
 {{- range .Values.ingress.hosts }}
 {{- $hosts = append $hosts (printf "Host(`%s`)" .) }}
 {{- end }}
-{{- $rule := join " || " $hosts }}
+{{- /* Parentheses are mandatory: `&&` binds tighter than `||`. */ -}}
+{{- $hostGroup := printf "(%s)" (join " || " $hosts) }}
+{{- $ep := default "web" .Values.ingress.entryPoint }}
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: {{ include "my-app.fullname" . }}-api
 spec:
-  entryPoints: ["websecure"]
+  entryPoints: [{{ $ep | quote }}]
   routes:
-    - match: {{ printf "%s && PathPrefix(`/api`)" $rule | quote }}
-      kind: Rule
+    - kind: Rule
+      match: {{ printf "%s && PathPrefix(`/api`)" $hostGroup | quote }}
       middlewares:
         - name: {{ include "my-app.fullname" . }}-strip-api
       services:
         - name: {{ include "my-app.fullname" . }}-api
           port: {{ .Values.service.api.port }}
-    - match: {{ printf "%s && PathPrefix(`/ws`)" $rule | quote }}
-      kind: Rule
+    - kind: Rule
+      match: {{ printf "%s && (PathPrefix(`/ws`) || PathPrefix(`/webhooks`))" $hostGroup | quote }}
       services:
         - name: {{ include "my-app.fullname" . }}-api
           port: {{ .Values.service.api.port }}
-  {{- if .Values.ingress.tls.secretName }}
-  tls:
-    secretName: {{ .Values.ingress.tls.secretName }}
-  {{- end }}
 ---
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: {{ include "my-app.fullname" . }}-web
 spec:
-  entryPoints: ["websecure"]
+  entryPoints: [{{ $ep | quote }}]
   routes:
-    - match: {{ $rule | quote }}
-      kind: Rule
+    - kind: Rule
+      match: {{ $hostGroup | quote }}
       services:
         - name: {{ include "my-app.fullname" . }}-web
           port: {{ .Values.service.web.port }}
-  {{- if .Values.ingress.tls.secretName }}
-  tls:
-    secretName: {{ .Values.ingress.tls.secretName }}
-  {{- end }}
 {{- end }}
 ```
 
-Notes that prevent real outages:
+Keep health/metrics endpoints (`/healthz`, `/readyz`, `/metrics`) **out** of the public
+routes. With a catch-all they fall through to the frontend and return its responses —
+noisy and confusing, though not a leak to the API. Add an explicit route/Middleware if you
+need a real 404.
 
-1. **Route specificity.** Traefik matches by rule priority, so `/api` and `/ws` routes must
-   be on a **different `IngressRoute` resource** than the catch-all `/`. Otherwise the
-   catch-all wins and API calls land on the frontend.
-2. **Wildcard hosts** require `Host(\`*.example.com\`)` **in addition to** the apex host —
-   list both in `ingress.hosts`.
-3. **Do not expose `/metrics`, `/healthz`, `/readyz` on the public Ingress.** They are for
-   the cluster; publishing them leaks internals and route counters.
-4. **TLS without a cert source is worse than no TLS**: Traefik serves its self-signed
-   default cert, which browsers reject. Empty `tls.secretName` must mean "HTTP only",
-   explicitly.
+### Migration reference: what the nginx annotations meant
+
+| nginx | Traefik equivalent |
+|---|---|
+| `ingressClassName: nginx` | `traefik`, plus `entryPoints` on the `IngressRoute` |
+| `rewrite-target: /$2` + regex path | `Middleware` `stripPrefix` |
+| `proxy-body-size` | `Middleware` `buffering` / `serversTransport` |
+| `proxy-read-timeout` / `proxy-send-timeout` | `serversTransport` or entrypoint config |
+| Any `nginx.*` annotation | **Silently ignored by Traefik** — no warning, no error |
+
 
 ## Secrets: every `secretKeyRef` is a startup dependency
 
@@ -984,6 +998,8 @@ Real defects found while auditing `crm-whats`; each one lints clean.
 |---|---|---|
 | `pre-install` Job that needs the chart's own Postgres | First install hangs forever | Plain `Job` / initContainer with wait-and-retry |
 | nginx annotations on a Traefik cluster | Every `/api` path 404s | `Middleware stripPrefix` + `IngressRoute`, or `ingress.controller` value |
+| `Host(\`*.example.com\`)` for subdomain tenancy | `Host` compares strings; the wildcard never matches a real tenant, so **no tenant can open** | `HostRegexp` with the wildcard translated to `^[^.]+\.example\.com$` |
+| Presigned S3 URL behind a path prefix (`/storage` + `stripPrefix`) | `403 SignatureDoesNotMatch` — SigV4 signs the full path, so stripping it invalidates the signature | Dedicated host (no prefix), or rename the bucket to match the prefix and skip stripping |
 | `tls:` enabled when an external proxy already terminates TLS | Traefik serves its self-signed cert on `websecure`; the edge cannot reach it | Chart is HTTP-only; route on the `web` entrypoint |
 | Proxy not sending `X-Forwarded-Proto` | `Secure` cookies dropped, absolute URLs in `http://`, rate limit sees one IP | Forward `X-Forwarded-Proto/Host/For`; enable `trustProxy` |
 | Proxy rewriting `Host` | Subdomain tenancy fails, host guards reject | Preserve the original `Host` header |

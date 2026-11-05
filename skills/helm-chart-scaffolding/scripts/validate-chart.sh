@@ -11,6 +11,11 @@ set -e
 
 CHART_DIR="${1:-.}"
 VALUES_FILE="${2:-}"
+# `RELEASE_NAME` pode ser fixado por `RELEASE_NAME=meu-release`, útil quando o
+# chart amarra o nome do release a nomes de Service/DSN (guard de render). Um
+# nome genérico como `test-release` faz o `fullname` virar `test-release-<chart>`
+# e quebra charts que exigem um release name específico — o erro aparece como
+# "Template rendering failed", não como bug do guard.
 RELEASE_NAME="${RELEASE_NAME:-test-release}"
 NAMESPACE="${NAMESPACE:-default}"
 STRICT="${STRICT:-0}"
@@ -203,12 +208,50 @@ fi
 if [ "${MISSING_SECRET:-0}" = "1" ]; then error "required Secret missing"; [ "$STRICT" = "1" ] && exit 1; fi
 echo ""
 
-# 4e. Perfil do cluster: o controller de Ingress do chart existe?
-echo "4️⃣e Checking cluster profile (ingress controller / arch / storage)..."
+# 4e. Política Traefik-only + perfil do cluster
+echo "4️⃣e Checking Traefik policy and cluster profile..."
+# Regra dura deste ambiente: Traefik é o único controller suportado. Procuramos
+# nos DOCUMENTOS renderizados (não no texto cru, que inclui comentários do template).
+RENDER_DOCS=$(grep -vE '^[[:space:]]*#' /tmp/helm-rendered.yaml)
+
+if echo "$RENDER_DOCS" | grep -q 'nginx\.ingress\.kubernetes\.io'; then
+    error "PROIBIDO: o chart emite annotations ingress-nginx. Use Middleware/IngressRoute do Traefik."
+    TRAEFIK_VIOLATION=1
+fi
+if echo "$RENDER_DOCS" | grep -qE '^\s*ingressClassName:\s*"?nginx"?'; then
+    error "PROIBIDO: ingressClassName nginx. O cluster só tem Traefik."
+    TRAEFIK_VIOLATION=1
+fi
+if echo "$RENDER_DOCS" | grep -qE '^\s*rewrite-target:'; then
+    error "rewrite-target é nginx-only e ignorado pelo Traefik. Use Middleware stripPrefix."
+    TRAEFIK_VIOLATION=1
+fi
+
+TRAEFIK_ROUTES=$(echo "$RENDER_DOCS" | grep -c 'kind: IngressRoute' || true)
+if [ "${TRAEFIK_ROUTES:-0}" -gt 0 ]; then
+    success "chart uses Traefik IngressRoute ($TRAEFIK_ROUTES total)"
+    if echo "$RENDER_DOCS" | grep -q 'kind: Middleware'; then
+        success "Traefik Middleware present"
+    else
+        warning "no Traefik Middleware — confirm no prefix stripping is needed"
+    fi
+    # hostRules: `&&` tem precedência sobre `||`: regra sem parênteses casa o primeiro
+    # host em QUALQUER path. E `Host()` NÃO aceita wildcard (compara strings), então
+    # `Host(\`*.dominio\`)` nunca casa tenant — precisa ser HostRegexp.
+    if echo "$RENDER_DOCS" | grep -q 'Host(`\*'; then
+        error "Host(\`*...\`) NÃO é curinga no Traefik (compara strings): use HostRegexp(\`^[^.]+\\.dominio$\`)"
+        TRAEFIK_VIOLATION=1
+    fi
+    if echo "$RENDER_DOCS" | grep -E 'match:' | grep -q 'Host(`[^)]*`) *||.*Host(`[^)]*`) *&&'; then
+        error "regra Traefik sem parênteses no grupo de hosts: \`&&\` tem precedência sobre \`||\` e o primeiro Host casaria qualquer path"
+        TRAEFIK_VIOLATION=1
+    fi
+fi
+
 if [ "$SKIP_CLUSTER" != "1" ] && command -v kubectl &> /dev/null; then
     CLASSES=$(kubectl get ingressclass -o jsonpath='{range .items[*]}{.metadata.name} {end}' 2>/dev/null || true)
     echo "   ingressclasses: ${CLASSES:-(none)}"
-    CHART_CLASS=$(grep -oE '^[[:space:]]*ingressClassName: .*' /tmp/helm-rendered.yaml | awk '{print $2}' | tr -d '"' | sort -u)
+    CHART_CLASS=$(echo "$RENDER_DOCS" | grep -oE '^[[:space:]]*ingressClassName: .*' | awk '{print $2}' | tr -d '"' | sort -u)
     for c in $CHART_CLASS; do
         if [ -n "$CLASSES" ] && echo " $CLASSES " | grep -q " $c "; then
             success "ingressClass '$c' exists"
@@ -217,12 +260,6 @@ if [ "$SKIP_CLUSTER" != "1" ] && command -v kubectl &> /dev/null; then
             CLASS_MISMATCH=1
         fi
     done
-    # nginx annotations + traefik-only cluster is the classic silent failure
-    if grep -q 'nginx.ingress.kubernetes.io' /tmp/helm-rendered.yaml && \
-       [ -n "$CLASSES" ] && ! echo " $CLASSES " | grep -q ' nginx '; then
-        error "chart uses nginx annotations but no nginx IngressClass exists — they are silently ignored"
-        CLASS_MISMATCH=1
-    fi
     [ -n "$NODE_ARCH" ] && echo "   node architecture: $NODE_ARCH"
     # TLS: quem termina? O chart estar HTTP-only é correto quando há proxy no edge;
     # errado quando o cluster é o edge e não há cert-manager.
@@ -261,11 +298,16 @@ if [ "$SKIP_CLUSTER" != "1" ] && command -v kubectl &> /dev/null; then
             fi
         fi
     fi
-    if [ "${CLASS_MISMATCH:-0}" = "1" ] || [ "${DISK_RISK:-0}" = "1" ]; then
+    if [ "${CLASS_MISMATCH:-0}" = "1" ] || [ "${DISK_RISK:-0}" = "1" ] || [ "${TRAEFIK_VIOLATION:-0}" = "1" ]; then
         [ "$STRICT" = "1" ] && exit 1
     fi
 else
     warning "cluster checks skipped (SKIP_CLUSTER=1 or kubectl unavailable)"
+    # A política Traefik não depende do cluster: vale mesmo offline.
+    if [ "${TRAEFIK_VIOLATION:-0}" = "1" ]; then
+        error "Traefik policy violated — this environment is Traefik-only (no ingress-nginx)"
+        [ "$STRICT" = "1" ] && exit 1
+    fi
 fi
 echo ""
 
